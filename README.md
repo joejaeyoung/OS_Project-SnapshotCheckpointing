@@ -35,6 +35,109 @@
 
 ---
 
+## 🏗️ 아키텍처
+
+### 문제: 트리 하나를 한 트랜잭션에 담을 수 없다
+
+XV6 로그는 트랜잭션당 쓸 수 있는 블록 수가 정해져 있습니다. 그런데 스냅샷은 루트 디렉토리 전체를 복사하는 작업입니다.
+처음 구현은 `snapshot_create` 전체를 `begin_op` / `end_op`로 감쌌고, 파일이 몇 개만 늘어도 로그가 넘쳐 panic이 났습니다.
+
+**그래서 감싸는 자리를 바깥에서 안으로 옮겼습니다.** `snapshot_create` 자체에는 트랜잭션이 없고, 하위 작업이 각자 열고 닫습니다.
+
+```mermaid
+flowchart TB
+  SC["snapshot_create()<br/>트랜잭션 없음"] --> D1["create_dir(/snapshot)<br/>트랜잭션 1"]
+  D1 --> D2["create_dir(/snapshot/N)<br/>트랜잭션 1"]
+  D2 --> CT["copy_tree_recursive()"]
+  CT --> DIR["디렉토리 자식 — 트랜잭션 4개"]
+  CT --> FIL["파일 자식 — 트랜잭션 2개"]
+  CT --> META["write_metadata_file()<br/>5줄마다 end_op → begin_op"]
+  style SC fill:#ffe6cc
+  style META fill:#ffe6cc
+```
+
+| 작업 단위 | 트랜잭션 분할 |
+| --- | --- |
+| 디렉토리 자식 복사 | ① `ialloc` + 메타 ② `dirlink "."` ③ `dirlink ".."` ④ 부모에 `dirlink` |
+| 파일 자식 복사 | ① `ialloc` + addrs 복사 + refcnt 증가 ② 부모에 `dirlink` |
+| 메타 파일 쓰기 | 파일 생성 / `itrunc` 1개, 이후 **5줄마다 닫고 다시 엶** |
+| 스냅샷 삭제 | 항목 1개당 1개 |
+
+재귀 중에는 자식을 건드리기 전에 부모 inode의 sleeplock을 풀었다가 끝나면 다시 잡습니다. 트랜잭션 안에서 락을 오래 쥐지 않기 위한 것입니다.
+
+### 복사가 아니라 공유 — Copy-On-Write
+
+스냅샷은 데이터 블록을 복사하지 않습니다. **같은 블록을 가리키게 하고 참조 카운트만 올립니다.**
+
+```mermaid
+flowchart LR
+  subgraph 스냅샷_직후
+    O1["원본 inode"] --> B1[("블록 A<br/>refcnt 2")]
+    S1["스냅샷 inode"] --> B1
+  end
+  subgraph 원본에_쓰기
+    O2["원본 inode"] -->|"writei → bcow"| B2[("블록 A'<br/>refcnt 1<br/>새로 할당")]
+    S2["스냅샷 inode"] --> B3[("블록 A<br/>refcnt 1")]
+  end
+  스냅샷_직후 --> 원본에_쓰기
+  style B2 fill:#ffe6cc
+```
+
+파일을 공유할 때 refcnt를 올리는 대상은 직접 블록 12개, 간접 블록 자신, 그리고 **간접 블록이 가리키는 128개 엔트리 전부**입니다.
+
+### bcow() — 쓰기 직전에 갈라진다
+
+```mermaid
+flowchart TB
+  W["writei(off)"] --> BM["old = bmap(off/BSIZE)"]
+  BM --> C{"block_refcnt[old] ≤ 1"}
+  C -->|"예"| SAME["그대로 쓴다<br/>공유하는 곳 없음"]
+  C -->|"아니오"| NEW["balloc → memmove 512B<br/>refcnt[old]-- · refcnt[new] = 1"]
+  NEW --> U{"직접 블록인가"}
+  U -->|"예"| U1["addrs[n] = new · iupdate"]
+  U -->|"아니오"| U2["간접 블록도 bcow<br/>인덱스 엔트리 갱신"]
+  style NEW fill:#ffe6cc
+```
+
+간접 블록을 쓸 때는 **데이터 블록과 인덱스 블록 둘 다** COW 대상입니다. 인덱스 블록을 공유한 채로 엔트리만 고치면 스냅샷 쪽 경로까지 바뀌어 버리기 때문입니다.
+
+### 해제는 마지막 참조에서만
+
+```c
+static void bfree(int dev, uint b) {
+  if (block_refcnt[b] > 0) block_refcnt[b]--;
+  if (block_refcnt[b] == 0) {
+    // 이때만 비트맵에서 실제로 내린다
+  }
+}
+```
+
+### 롤백과 삭제
+
+```mermaid
+flowchart LR
+  R["snapshot_rollback(id)"] --> R1["현재 루트 엔트리 비우기<br/>de.inum = 0 (snapshot 폴더는 제외)"]
+  R1 --> R2["스냅샷 트리를 루트로 되복사"]
+  R2 --> R3["스냅샷 슬롯은 유지 — 다시 롤백 가능"]
+  D["snapshot_delete(id)"] --> D1["항목별로 refcnt 감소 + 엔트리 제거"]
+  D1 --> D2["루트 자신도 refcnt 감소"]
+  D2 --> D3["슬롯 valid = 0"]
+```
+
+### 추가한 시스템 콜
+
+| 번호 | 시그니처 | 하는 일 |
+| ---: | --- | --- |
+| 22 | `int snapshot_create(void)` | 스냅샷 생성, ID 반환 |
+| 23 | `int snapshot_rollback(int snap_id)` | 해당 스냅샷 상태로 되돌림 |
+| 24 | `int snapshot_delete(int snap_id)` | 스냅샷 제거 |
+| 25 | `int get_file_addrs(char *path, uint *addrs)` | 디버깅용 — inode의 addrs 조회 |
+| 26 | `int get_indirect_addrs(uint blockno, uint *out)` | 디버깅용 — 간접 블록 엔트리 조회 |
+
+최대 스냅샷 수는 10개이고, 반복 생성으로 inode가 바닥나는 문제를 만나 `mkfs`의 `NINODES`를 200에서 500으로 늘렸습니다.
+
+---
+
 ## 🚀 시작 가이드
 
 ### Requirements
@@ -76,6 +179,19 @@ $ snap_test
 # 파일 블록 주소 확인 (디버깅)
 $ print_addr <filename>
 ```
+
+---
+
+## ⚠️ 알려진 한계
+
+- **재부팅하면 스냅샷이 사라집니다.** `/snapshot/meta`는 쓰기만 하고 읽는 코드가 없습니다. `snapinit()`이 참조 카운트와 스냅샷 테이블을 전부 0으로 초기화합니다.
+- **`bcow()`가 `block_refcnt`를 락 없이 읽고 씁니다.** 소스에도 `//todo : 동시성 문제 방지를 위해 Lock 고려`로 남겨 두었습니다. 단일 프로세스 시나리오만 검증했습니다.
+- **`copy_file_with_cow()`는 데드 코드입니다.** 정의만 있고 호출되지 않습니다. 실제 공유는 `copy_tree_recursive` 안에 인라인되어 있습니다.
+- **`metadata_cache` 구조체도 데드 코드입니다.**
+- **롤백이 이전 루트의 블록을 회수하지 않습니다.** 디렉토리 엔트리를 `de.inum = 0`으로 덮어쓰기만 하고 inode와 블록은 그대로 둡니다.
+- `snapshot_create`가 `iput()` 이후에 `snap_root->inum`을 읽습니다.
+- `write_metadata_file`은 `FSSIZE`까지 순회하는데 `block_refcnt` 배열 크기는 `MAXBLOCKS`(10,000)입니다. 두 값의 근거가 서로 다릅니다.
+- `param.h`를 덮어쓰지 않아 `LOGSIZE` · `MAXOPBLOCKS`는 업스트림 기본값을 따릅니다.
 
 ---
 
@@ -181,9 +297,10 @@ snapshot_delete(snap_id);
 
 ### 6. 메타데이터 관리
 
-- `/snapshot/meta` 파일에 블록별 참조 카운트 영속적 저장
-- 트랜잭션 단위로 분할 기록하여 **로그 용량 초과 방지**
-- `metadata_cache` 구조체로 메모리 캐싱 및 dirty 플래그 관리
+- `/snapshot/meta` 파일에 블록별 참조 카운트를 `Block N: refcnt=M` 형식의 텍스트로 덤프
+- 트랜잭션 단위로 분할 기록하여 **로그 용량 초과 방지** (5줄마다 `end_op` → `begin_op`)
+- **읽어 들이는 코드는 없습니다.** 부팅 시 `snapinit()`이 `block_refcnt`를 0으로 초기화하므로 영속성은 성립하지 않습니다. 디버깅용 덤프입니다
+- `metadata_cache` 구조체는 선언만 되어 있고 어느 필드도 사용되지 않습니다
 
 ---
 
